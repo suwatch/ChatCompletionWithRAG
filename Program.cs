@@ -1,13 +1,17 @@
 ﻿using System.ClientModel.Primitives;
 using System.ComponentModel;
 using System.Diagnostics;
-using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using Azure.AI.OpenAI;
+using Azure.Core;
 using Azure.Identity;
-using Microsoft.Extensions.AI;
+using Microsoft.Azure.Cosmos;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.VectorData;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
+using Microsoft.SemanticKernel.Connectors.InMemory;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
 using Microsoft.SemanticKernel.Data;
 using Microsoft.SemanticKernel.Embeddings;
@@ -19,6 +23,7 @@ namespace ChatCompletionWithRAG
     internal static class Program
     {
         public const string DefaultFileExtensions = "*.txt,*.md";
+        public const string VectorDatabaseName = "antragdb";
 
         // set AZUREAI_NAME=your-azure-ai-name
         // make sure to Grant yourself "Cognitive Services OpenAI Contributor" RBAC to the AzureAI resource
@@ -28,44 +33,164 @@ namespace ChatCompletionWithRAG
         // set AZUREAI_TEXTEMBEDDING_DEPLOYMENTNAME=your-azure-ai-textembedding-deployment-name
         public static readonly string AzureAITextEmbeddingDeploymentName = EnsureEnvironmentVariable("AZUREAI_TEXTEMBEDDING_DEPLOYMENTNAME");
         public static readonly TraceLevel HttpLoggingTraceLevel = int.TryParse(Environment.GetEnvironmentVariable("AZUREAI_HTTPLOGGING_TRACELEVEL"), out var value) ? (TraceLevel)value : TraceLevel.Off;
+        public static readonly string RAGCacheDirectory = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AZUREAI_CACHE_DIRECTORY"))
+            ? Environment.GetEnvironmentVariable("AZUREAI_CACHE_DIRECTORY") : Path.Combine(Environment.ExpandEnvironmentVariables(@"%USERPROFILE%\ChatCompletionWithRAGCache"));
+
+        static Dictionary<string, Func<string[], Task>> _methods = new(StringComparer.OrdinalIgnoreCase)
+        {
+            { nameof(Usage), Usage },
+            { nameof(Learn), Learn },
+            { nameof(Assist), Assist },
+            { nameof(CleanCache), CleanCache },
+        };
 
         static async Task Main(string[] args)
         {
             try
             {
-                if (args.Length == 0)
+                //var cosmosClient = new CosmosClient(
+                //    accountEndpoint: "https://kuduaicosmosdbnosql.documents.azure.com:443/",
+                //    tokenCredential: DefaultAzureCredentialHelper.GetDefaultAzureCredential(AzureAuthorityHosts.AzurePublicCloud.AbsoluteUri),
+                //    new CosmosClientOptions()
+                //    {
+                //        // When initializing CosmosClient manually, setting this property is required 
+                //        // due to limitations in default serializer. 
+                //        UseSystemTextJsonSerializerWithOptions = JsonSerializerOptions.Default,
+                //    });
+                //await cosmosClient.CreateDatabaseAsync("antragdb");
+                //var database = cosmosClient.GetDatabase("kuduaidb");
+                //var container = database.GetContainer("pdfcontent");
+                //await container.DeleteContainerAsync();
+                //var collection = await database.CreateContainerIfNotExistsAsync("pdfcontent", "/Key");
+                //return cosmosClient.GetDatabase(appConfig.AzureCosmosDBNoSQLConfig.DatabaseName);
+
+                var action = args.Length == 0 ? "Usage" : args[0];
+                if (!_methods.TryGetValue(action, out var func))
                 {
-                    Console.WriteLine("Usage:");
-                    Console.WriteLine("ChatCompletionWithRAG.exe directory");
-                    Console.WriteLine("ChatCompletionWithRAG.exe directory *.txt,*.md");
-                    Console.WriteLine("ChatCompletionWithRAG.exe CleanCache");
+
+                    Console.WriteLine($"Action '{action}' is not supported");
+                    await Usage(args);
                     return;
                 }
-                else if (args[0] == "CleanCache")
-                {
-                    Directory.Delete(RAGFileInfo.RAGCacheDirectory, recursive: true);
-                    Console.WriteLine($"{RAGFileInfo.RAGCacheDirectory} deleted");
-                    return;
-                }
 
-                var directory = args[0];
-                var patterns = args.Length > 1 ? args[1] : DefaultFileExtensions;
-
-                var kernel = CreateKernelWithPlugins();
-                var textEmbeddingService = kernel.GetRequiredService<ITextEmbeddingGenerationService>();
-
-                var ragFiles = await LearnFromDirectoryAsync(directory, patterns, kernel, textEmbeddingService);
-
-                kernel.Plugins.AddFromObject(new InformationProvider(ragFiles, kernel, textEmbeddingService), pluginName: "InformationProvider");
-
-                //await RunChatLoop(kernel);
-
-                await RunChatLoopWithTemplate(kernel);
+                await func(args);
             }
             catch (Exception ex)
             {
                 Console.WriteLine(ex);
             }
+        }
+
+        static async Task Assist(string[] args)
+        {
+            if (args.Length != 2)
+            {
+                Console.WriteLine("ChatCompletionWithRAG.exe Assist category");
+                return;
+            }
+
+            var category = args[1];
+            var kernel = CreateKernelWithPlugins(category);
+            //var vectorStore = kernel.GetRequiredService<IVectorStore>();
+            var collection = kernel.GetRequiredService<IVectorStoreRecordCollection<string, RAGFileInfo>>();
+            if (collection is InMemoryVectorStoreRecordCollection<string, RAGFileInfo>)
+            {
+                throw new NotSupportedException("Assist is not supported for InMemoryVectorStore");
+            }
+
+            var textEmbeddingService = kernel.GetRequiredService<ITextEmbeddingGenerationService>();
+            kernel.Plugins.AddFromObject(new TextSearchProvider(collection, kernel, textEmbeddingService), pluginName: "TextSearchProvider");
+
+            //await RunChatLoop(kernel);
+            await RunChatLoopWithTemplate(kernel);
+        }
+
+        static async Task Learn(string[] args)
+        {
+            if (args.Length < 2)
+            {
+                Console.WriteLine("ChatCompletionWithRAG.exe Learn category directory [*.txt,*.md]");
+                return;
+            }
+
+            var category = args[1];
+            var directory = args[2];
+            var patterns = args.Length > 3 ? args[3] : DefaultFileExtensions;
+
+            var kernel = CreateKernelWithPlugins(category);
+            //var vectorStore = kernel.GetRequiredService<IVectorStore>();
+            //var collection = vectorStore.GetCollection<string, RAGFileInfo>(category);
+            //await collection.CreateCollectionIfNotExistsAsync();
+
+            var collection = kernel.GetRequiredService<IVectorStoreRecordCollection<string, RAGFileInfo>>();
+            if (!(await collection.CollectionExistsAsync()))
+                await collection.CreateCollectionIfNotExistsAsync();
+
+            // Create and upsert glossary entries into the collection.
+            var textEmbeddingService = kernel.GetRequiredService<ITextEmbeddingGenerationService>();
+            var ragFiles = await LearnAndUpsertAsync(collection, directory, patterns, kernel, textEmbeddingService).ConfigureAwait(false);
+            // Testing Cache
+            // await LearnAndUpsertAsync(collection, directory, patterns, kernel, textEmbeddingService).ConfigureAwait(false);
+
+            if (collection is InMemoryVectorStoreRecordCollection<string, RAGFileInfo>)
+            {
+                kernel.Plugins.AddFromObject(new LocalFileSearchProvider(ragFiles, kernel, textEmbeddingService), pluginName: nameof(LocalFileSearchProvider));
+                kernel.Plugins.AddFromObject(new TextSearchProvider(collection, kernel, textEmbeddingService), pluginName: nameof(TextSearchProvider));
+
+                //await RunChatLoop(kernel);
+                await RunChatLoopWithTemplate(kernel);
+            }
+        }
+
+        static async Task<List<RAGFileInfo>> LearnAndUpsertAsync(IVectorStoreRecordCollection<string, RAGFileInfo> collection, string directory, string patterns, Kernel kernel, ITextEmbeddingGenerationService textEmbeddingService)
+        {
+            var ragFiles = new List<RAGFileInfo>();
+            var startIndex = 0;
+            var batchSize = 3;
+            await foreach (var ragFile in LearnFromDirectoryAsync(collection, directory, patterns, kernel, textEmbeddingService))
+            {
+                ragFiles.Add(ragFile);
+                if (ragFiles.Count % batchSize == 0)
+                {
+                    //await foreach (var result in collection.UpsertBatchAsync(ragFiles.Skip(startIndex)))
+                    //{
+                    //    var item = ragFiles.Find(r => r.Key == result);
+                    //    Console.WriteLine($"Upsert: {result}, File: {item.FullName}#{item.ChunkIndex:000}");
+                    //}
+                    await collection.UpsertBatchAsync(ragFiles.Skip(startIndex)).ToListAsync();
+                    startIndex = ragFiles.Count;
+                }
+            }
+            if (ragFiles.Count > startIndex)
+            {
+                //await foreach (var result in collection.UpsertBatchAsync(ragFiles.Skip(startIndex)))
+                //{
+                //    var item = ragFiles.Find(r => r.Key == result);
+                //    //Console.WriteLine($"Upsert: {result}, File: {item.FullName}#{item.ChunkIndex:000}");
+                //}
+                await collection.UpsertBatchAsync(ragFiles.Skip(startIndex)).ToListAsync();
+            }
+
+            return ragFiles;
+            //var ragFiles = await LearnFromDirectoryAsync(directory, patterns, kernel, textEmbeddingService);
+            // need to chunk
+            //await collection.UpsertBatchAsync(ragFiles).ToListAsync();
+        }
+
+        static Task CleanCache(string[] args)
+        {
+            Directory.Delete(Program.RAGCacheDirectory, recursive: true);
+            Console.WriteLine($"{Program.RAGCacheDirectory} deleted");
+            return Task.CompletedTask;
+        }
+
+        static Task Usage(string[] args)
+        {
+            Console.WriteLine("Usage:");
+            Console.WriteLine("ChatCompletionWithRAG.exe Learn category directory [*.txt,*.md]");
+            Console.WriteLine("ChatCompletionWithRAG.exe CleanCache");
+            Console.WriteLine("ChatCompletionWithRAG.exe Assist category");
+            return Task.CompletedTask;
         }
 
         static async Task RunChatLoop(Kernel kernel)
@@ -94,18 +219,12 @@ namespace ChatCompletionWithRAG
             }
         }
 
-        public class QuestionsResult
-        {
-            public string OriginalQuestion { get; set; }
-            public string[] AlternativeQuestions { get; set; }
-        }
-
         static async Task RunChatLoopWithTemplate(Kernel kernel)
         {
             var chatClient = kernel.GetRequiredService<IChatCompletionService>();
             var alternativeQuestionsTemplate = """
                 You are an AI language model assistant. 
-                Your task is to generate five different versions of the given user question to retrieve relevant documents from a vector database.
+                Your task is to generate 5 different versions of the given user question to retrieve relevant documents from a vector database.
                 By generating alternative questions, you can improve the quality of the retrieved documents.
                 Original question: {{$originalQuestion}}
                 """;
@@ -122,14 +241,14 @@ namespace ChatCompletionWithRAG
 
             var promptTemplate = """
                 Answer the question based on the following information: 
-                {{InformationProvider.GetInformation $query}}.
+                {{LocalFileSearchProvider.GetInformation $query}}.
                 Do include source references in your answer as footnotes.
                 Question: {{$originalQuestion}}
                 """;
 
             var promptSearchResultsTemplate = """
                 Please use this information to answer the question:
-                {{#with (InformationProvider-GetTextSearchResults query)}}  
+                {{#with (TextSearchProvider-GetTextSearchResults query)}}  
                     {{#each this}}  
                         Name: {{Name}}
                         Value: {{Value}}
@@ -137,16 +256,14 @@ namespace ChatCompletionWithRAG
                         -----------------
                     {{/each}}
                 {{/with}}
-
                 Include link to the relevant source in the response as footnotes.
-                    
                 Question: {{originalQuestion}}
                 """;
 
             while (true)
             {
                 Console.Write("Question: ");
-                var originalQuestion = "how long is MSI token cached?"; // Console.ReadLine();
+                var originalQuestion = "How long is MSI token cached?"; // Console.ReadLine();
                 if (string.IsNullOrWhiteSpace(originalQuestion))
                 {
                     break;
@@ -164,45 +281,65 @@ namespace ChatCompletionWithRAG
                     Console.WriteLine($"Alternative Question[{i}]: {questionsResult.AlternativeQuestions[i]}");
                 }
 
-                //result = await kernel.InvokePromptAsync(
-                //    promptTemplate: promptTemplate,
-                //    arguments: new() { { "originalQuestion", originalQuestion }, { "query", result } })
-                //    .WithProgress().ConfigureAwait(false);
-                //Console.WriteLine($"Answer: {result}");
-
-                var results = kernel.InvokePromptStreamingAsync(
-                    promptTemplate: promptSearchResultsTemplate,
-                    templateFormat: "handlebars",
-                    promptTemplateFactory: new HandlebarsPromptTemplateFactory(),
-                    arguments: new() { { "originalQuestion", originalQuestion }, { "query", questionsResult } });
-                Console.Write($"Answer: ");
-                await foreach (var res in results)
+                var useLocalFile = false;
+                if (useLocalFile)
                 {
-                    Console.Write($"{res}");
+                    result = await kernel.InvokePromptAsync(
+                        promptTemplate: promptTemplate,
+                        arguments: new() { { "originalQuestion", originalQuestion }, { "query", result } })
+                        .WithProgress().ConfigureAwait(false);
+                    Console.WriteLine($"Answer: {result}");
+                }
+                else
+                {
+                    var results = kernel.InvokePromptStreamingAsync(
+                        promptTemplate: promptSearchResultsTemplate,
+                        templateFormat: "handlebars",
+                        promptTemplateFactory: new HandlebarsPromptTemplateFactory(),
+                        arguments: new() { { "originalQuestion", originalQuestion }, { "query", questionsResult } });
+                    Console.Write($"Answer: ");
+                    await foreach (var res in results)
+                    {
+                        Console.Write($"{res}");
+                    }
                 }
 
                 Console.WriteLine();
-
                 break;
             }
         }
 
-        static async Task<List<RAGFileInfo>> LearnFromDirectoryAsync(string directory, string patterns, Kernel kernel, ITextEmbeddingGenerationService textEmbeddingService)
+//        static async IAsyncEnumerable<RAGFileInfo> LearnFromDirectoryExAsync(string directory, string patterns, Kernel kernel, ITextEmbeddingGenerationService textEmbeddingService)
+//        {
+//            Console.WriteLine($"Learning from {directory} with patterns {patterns}");
+//            Console.WriteLine($"Caching at {Program.RAGCacheDirectory}");
+//            var results = new List<RAGFileInfo>();
+//            foreach (var pattern in patterns.Split([',', ';']))
+//            {
+//                await foreach (var ragFile in RAGFileInfo.EnumerateDirectory(directory, pattern, kernel, textEmbeddingService))
+//                {
+//                    yield return ragFile;
+//                }
+//            }
+////            return results;
+//        }
+
+        static async IAsyncEnumerable<RAGFileInfo> LearnFromDirectoryAsync(IVectorStoreRecordCollection<string, RAGFileInfo> collection, string directory, string patterns, Kernel kernel, ITextEmbeddingGenerationService textEmbeddingService)
         {
             Console.WriteLine($"Learning from {directory} with patterns {patterns}");
-            Console.WriteLine($"Caching at {RAGFileInfo.RAGCacheDirectory}");
+            Console.WriteLine($"Caching at {Program.RAGCacheDirectory}");
             var results = new List<RAGFileInfo>();
             foreach (var pattern in patterns.Split([',', ';']))
             {
-                await foreach (var ragFile in RAGFileInfo.EnumerateDirectory(directory, pattern, kernel, textEmbeddingService))
+                await foreach (var ragFile in RAGFileInfo.EnumerateDirectory(collection, directory, pattern, kernel, textEmbeddingService))
                 {
-                    results.Add(ragFile);
+                    yield return ragFile;
                 }
             }
-            return results;
+            //return results;
         }
 
-        private static Kernel CreateKernelWithPlugins(params Type[] pluginTypes)
+        private static Kernel CreateKernelWithPlugins(string category, params Type[] pluginTypes)
         {
             var clientOptions = new AzureOpenAIClientOptions();
             if (HttpLoggingTraceLevel != TraceLevel.Off)
@@ -219,6 +356,31 @@ namespace ChatCompletionWithRAG
             var builder = Kernel.CreateBuilder();
             builder.AddAzureOpenAIChatCompletion(AzureAIDeploymentName, customClient);
             builder.AddAzureOpenAITextEmbeddingGeneration(AzureAITextEmbeddingDeploymentName, azureOpenAIClient: customClient);
+
+            // VectorStore
+            var useInMemoryVectorStore = false;
+            if (useInMemoryVectorStore)
+            {
+                // builder.AddInMemoryVectorStore();
+                builder.AddInMemoryVectorStoreRecordCollection<string, RAGFileInfo>(category);
+            }
+            else
+            {
+                builder.Services.AddSingleton<Database>(
+                    sp => new CosmosClient(
+                            accountEndpoint: "https://kuduaicosmosdbnosql.documents.azure.com:443/",
+                            tokenCredential: DefaultAzureCredentialHelper.GetDefaultAzureCredential(AzureAuthorityHosts.AzurePublicCloud.AbsoluteUri), // new AzureCliCredential(),
+                            new CosmosClientOptions()
+                            {
+                                // When initializing CosmosClient manually, setting this property is required 
+                                // due to limitations in default serializer. 
+                                UseSystemTextJsonSerializerWithOptions = JsonSerializerOptions.Default,
+                                HttpClientFactory = () => new HttpClient(new HttpLoggingHandler(verbose: HttpLoggingTraceLevel == TraceLevel.Verbose)),
+                            }).GetDatabase(VectorDatabaseName));
+                // GetCollections not working - Only String and AzureCosmosDBNoSQLCompositeKey keys are supported
+                // builder.AddAzureCosmosDBNoSQLVectorStore();
+                builder.AddAzureCosmosDBNoSQLVectorStoreRecordCollection<RAGFileInfo>(category);
+            }
 
             foreach (var pluginType in pluginTypes)
             {
@@ -248,79 +410,6 @@ namespace ChatCompletionWithRAG
             Console.WriteLine();
 
             return await task.ConfigureAwait(false);
-        }
-
-        private sealed class InformationProvider(IList<RAGFileInfo> ragFiles, Kernel kernel, ITextEmbeddingGenerationService textEmbeddingService)
-        {
-            [KernelFunction]
-            [Description("Retrieve information and its reference to help answer any question.")]
-            public async Task<string> GetInformation(
-                [Description("The questions being asked")] QuestionsResult questionsResult)
-            {
-                var relevancies = new Dictionary<string, (int hits, float relevance, int chunkIndex)>(StringComparer.OrdinalIgnoreCase);
-                var questionVectors = await textEmbeddingService.GenerateEmbeddingsAsync(questionsResult.AlternativeQuestions, kernel: kernel).ConfigureAwait(false);
-                for (int q = 0; q < questionVectors.Count; ++q)
-                {
-                    var questionVector = questionVectors[q];
-                    var question = questionsResult.AlternativeQuestions[q];
-                    var results = ragFiles
-                        .Select(f => (file: f, relevance: f.CompareVectors(questionVector), question: question))
-                        .OrderByDescending(f => f.relevance)
-                        .Take(2).ToList();
-                    for (int a = 0; a < results.Count; ++a)
-                    {
-                        var result = results[a];
-                        relevancies[result.file.FullName] = relevancies.TryGetValue(result.file.FullName, out var value)
-                            ? (value.hits + 1, value.relevance + result.relevance, value.chunkIndex)
-                            : (1, result.relevance, result.file.ChunkIndex);
-
-                        Console.WriteLine($"[HIT#q{q}a{a}] Relevance: {result.relevance:0.00}, Total: {relevancies[result.file.FullName]:0.00}, file: {result.file.FullName}[chunk#{result.file.ChunkIndex}]");
-                    }
-                }
-
-                var mostRelevance = relevancies.OrderByDescending(r => r.Value).First();
-
-                Console.WriteLine($"[BestMatchedDoc] Hits: {mostRelevance.Value.hits} out of {2 * questionVectors.Count}, Relevance: {mostRelevance.Value.relevance:0.00}, file: {mostRelevance.Key}[chunk#{mostRelevance.Value.chunkIndex}]");
-
-                return JsonSerializer.Serialize(new { AssistantMessage = File.ReadAllText(mostRelevance.Key), Reference = mostRelevance.Key });
-            }
-
-            [KernelFunction]
-            [Description("Retrieve top search results to help answer any question.")]
-            public async Task<IEnumerable<TextSearchResult>> GetTextSearchResults(
-                [Description("The questions being asked")] QuestionsResult questionsResult)
-            {
-                var relevancies = new Dictionary<string, (int hits, float relevance, int chunkIndex)>(StringComparer.OrdinalIgnoreCase);
-                var questionVectors = await textEmbeddingService.GenerateEmbeddingsAsync(questionsResult.AlternativeQuestions, kernel: kernel).ConfigureAwait(false);
-                for (int q = 0; q < questionVectors.Count; ++q)
-                {
-                    var questionVector = questionVectors[q];
-                    var question = questionsResult.AlternativeQuestions[q];
-                    var results = ragFiles
-                        .Select(f => (file: f, relevance: f.CompareVectors(questionVector), question: question))
-                        .OrderByDescending(f => f.relevance)
-                        .Take(2).ToList();
-                    for (int a = 0; a < results.Count; ++a)
-                    {
-                        var result = results[a];
-                        relevancies[result.file.FullName] = relevancies.TryGetValue(result.file.FullName, out var value)
-                            ? (value.hits + 1, value.relevance + result.relevance, value.chunkIndex)
-                            : (1, result.relevance, result.file.ChunkIndex);
-
-                        Console.WriteLine($"[HIT#q{q}a{a}] Relevance: {result.relevance:0.00}, Total: {relevancies[result.file.FullName]:0.00}, file: {result.file.FullName}[chunk#{result.file.ChunkIndex}]");
-                    }
-                }
-
-                var searchResults = new List<TextSearchResult>();
-                foreach (var relevance in relevancies.OrderByDescending(r => r.Value).Take(1))
-                {
-                    Console.WriteLine($"[BestMatchedDoc] Hits: {relevance.Value.hits} out of {2 * questionVectors.Count}, Relevance: {relevance.Value.relevance:0.00}, file: {relevance.Key}[chunk#{relevance.Value.chunkIndex}]");
-                    var content = await File.ReadAllTextAsync(relevance.Key).ConfigureAwait(false);
-                    searchResults.Add(new TextSearchResult(content) { Link = relevance.Key, Name = relevance.Key });
-                }
-
-                return searchResults;
-            }
         }
     }
 }

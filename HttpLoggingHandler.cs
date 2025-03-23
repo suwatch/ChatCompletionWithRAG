@@ -38,14 +38,17 @@ namespace ChatCompletionWithRAG
                     WriteLine(string.Join("; ", header.Value));
                 }
             }
-            foreach (var header in request.Content.Headers)
+            if (request.Content is not null)
             {
-                WriteLine($"{header.Key}: {string.Join("; ", header.Value)}");
+                foreach (var header in request.Content.Headers)
+                {
+                    WriteLine($"{header.Key}: {string.Join("; ", header.Value)}");
+                }
             }
 
             WriteLine();
 
-            if (_verbose)
+            if (_verbose && request.Content is not null)
             {
                 request.Content = await DumpContent(request.Content, cancellationToken, async).ConfigureAwait(false);
                 WriteLine();
@@ -67,20 +70,23 @@ namespace ChatCompletionWithRAG
                 Write($"{header.Key}: ");
                 WriteLine(string.Join("; ", header.Value));
             }
-            foreach (var header in response.Content.Headers)
+            if (response.Content is not null)
             {
-                Write($"{header.Key}: ");
-                WriteLine(string.Join("; ", header.Value));
+                foreach (var header in response.Content.Headers)
+                {
+                    Write($"{header.Key}: ");
+                    WriteLine(string.Join("; ", header.Value));
+                }
             }
             WriteLine();
 
-            if (_verbose)
+            if (_verbose && response.Content is not null)
             {
                 response.Content = await DumpContent(response.Content, cancellationToken, async).ConfigureAwait(false);
                 WriteLine();
             }
 
-            WriteLine($"---------- Done ({(int)response.StatusCode} {response.StatusCode}, {watch.ElapsedMilliseconds} ms, request: {request.Content.Headers.ContentLength} bytes) ------------");
+            WriteLine($"---------- Done ({(int)response.StatusCode} {response.StatusCode}, {watch.ElapsedMilliseconds} ms, request: {request.Content?.Headers.ContentLength} bytes) ------------");
             return response;
         }
 

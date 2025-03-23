@@ -9,13 +9,17 @@
 
   <ItemGroup>
     <PackageReference Include="Azure.Identity" Version="1.13.2" />
+    <PackageReference Include="Microsoft.Azure.Cosmos" Version="3.47.2" />
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="1.0.2" />
     <PackageReference Include="Microsoft.ML.Tokenizers.Data.Cl100kBase" Version="1.0.2" />
     <PackageReference Include="Microsoft.SemanticKernel" Version="1.40.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Connectors.AzureCosmosDBNoSQL" Version="1.40.0-preview" />
     <PackageReference Include="Microsoft.SemanticKernel.Connectors.AzureOpenAI" Version="1.40.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Connectors.InMemory" Version="1.40.1-preview" />
     <PackageReference Include="Microsoft.SemanticKernel.PromptTemplates.Handlebars" Version="1.40.1" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <PackageReference Include="Newtonsoft.Json.Schema" Version="4.0.1" />
+    <PackageReference Include="System.Linq.Async" Version="6.0.1" />
   </ItemGroup>
 
 </Project>

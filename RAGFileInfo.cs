@@ -1,43 +1,45 @@
 ﻿using System.Numerics.Tensors;
-using System.Runtime.InteropServices.ComTypes;
+using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.VectorData;
 using Microsoft.ML.Tokenizers;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Embeddings;
 using Microsoft.SemanticKernel.Text;
+using static Microsoft.SemanticKernel.Text.TextChunker;
 
 namespace ChatCompletionWithRAG
 {
     public class RAGFileInfo
     {
         public static readonly Lazy<Tokenizer> Tokenizer = new(() => TiktokenTokenizer.CreateForModel("text-embedding-3-small"));
-        public static readonly string RAGCacheDirectory = Path.Combine(Environment.ExpandEnvironmentVariables(@"%USERPROFILE%\ChatCompletionWithRAGCache"));
 
+        private string _key;
+
+        [VectorStoreRecordKey]
+        //public uint Key { get => (_key ?? Fnv1aHashHelper.ComputeHash(Encoding.UTF8.GetBytes($"{FullName}#{ChunkIndex}"))); set => _key = value; }
+        public string Key { get => (_key ?? (_key  = $"{Fnv1aHashHelper.ComputeHash(FullName.ToLowerInvariant()):x8}-{ChunkIndex:0000}")); set => _key = value; }
+        [VectorStoreRecordData(IsFilterable = true)]
         public string FullName { get; set; }
-        public string CacheFile { get; set; }
+        [VectorStoreRecordData]
         public int ChunkIndex { get; set; }
-        public ReadOnlyMemory<float> Vector { get; set; }
+        [VectorStoreRecordData]
+        public DateTimeOffset? LastModifiedTimeUtc { get; set; }
+        [VectorStoreRecordVector(1536)]
+        public ReadOnlyMemory<float> TextEmbedding { get; set; }
 
         public float CompareVectors(ReadOnlyMemory<float> b)
         {
-            var a = Vector;
+            var a = TextEmbedding;
             if (a.Length != b.Length || a.Span.Length == 0 || b.Span.Length == 0)
             {
                 return -1;
             }
 
             return TensorPrimitives.CosineSimilarity(a.Span, b.Span);
-            //return TensorPrimitives.Dot(a.Span, b.Span);
-            //float result = 0;
-            //for (int i = 0; i < a.Length; i++)
-            //{
-            //    result += a.Span[i] * b.Span[i];
-            //}
-
-            //return result;
         }
 
-        public static async IAsyncEnumerable<RAGFileInfo> EnumerateDirectory(string directoryName, string searchPattern, Kernel kernel, ITextEmbeddingGenerationService textEmbeddingService, SearchOption option = SearchOption.AllDirectories)
+        public static async IAsyncEnumerable<RAGFileInfo> EnumerateDirectory(IVectorStoreRecordCollection<string, RAGFileInfo> collection, string directoryName, string searchPattern, Kernel kernel, ITextEmbeddingGenerationService textEmbeddingService, SearchOption option = SearchOption.AllDirectories)
         {
             var directory = new DirectoryInfo(directoryName);
             if (!directory.Exists)
@@ -45,34 +47,45 @@ namespace ChatCompletionWithRAG
                 throw new DirectoryNotFoundException($"Directory not found: {directoryName}");
             }
 
-            var cacheDirectory = new DirectoryInfo(RAGCacheDirectory);
+            var cacheDirectory = new DirectoryInfo(Program.RAGCacheDirectory);
             if (!cacheDirectory.Exists)
             {
                 cacheDirectory.Create();
             }
 
-            SemaphoreSlim semaphore = new(4);
             var directoryNameHash = Fnv1aHashHelper.ComputeHash(directory.FullName.ToLowerInvariant());
             cacheDirectory = Directory.CreateDirectory(Path.Combine(cacheDirectory.FullName, $"{directoryNameHash:x8}"));
             foreach (var file in directory.EnumerateFiles(searchPattern, option))
             {
                 var fileNameHash = Fnv1aHashHelper.ComputeHash(file.FullName.ToLowerInvariant());
+                var result = await collection.GetAsync($"{fileNameHash:x8}-0000").ConfigureAwait(false);
+                if (result is not null)
+                {
+                    if (result.LastModifiedTimeUtc == file.LastWriteTimeUtc)
+                    {
+                        Console.WriteLine($"Already exists in VectorStore {file.FullName}");
+                        continue;
+                    }
+
+                    throw new NotSupportedException("Need to delete old item");
+                }
+
                 var fileDirectory = Directory.CreateDirectory(Path.Combine(cacheDirectory.FullName, $"{fileNameHash:x8}"));
                 var cacheFiles = fileDirectory.GetFiles("*.json");
                 var firstCacheFile = cacheFiles.FirstOrDefault();
 
                 if (firstCacheFile is not null && firstCacheFile.LastWriteTimeUtc == file.LastWriteTimeUtc)
                 {
-                    Console.WriteLine($"Already learned for {file.FullName}");
+                    Console.WriteLine($"Already learned {file.FullName}");
                     int chunkIndex = 0;
                     foreach (var cacheFile in cacheFiles)
                     {
                         yield return new()
                         { 
                             FullName = file.FullName,
-                            CacheFile = cacheFile.FullName,
                             ChunkIndex = chunkIndex,
-                            Vector = JsonSerializer.Deserialize<ReadOnlyMemory<float>>(await File.ReadAllTextAsync(cacheFile.FullName).ConfigureAwait(false)) 
+                            LastModifiedTimeUtc = file.LastWriteTimeUtc,
+                            TextEmbedding = JsonSerializer.Deserialize<ReadOnlyMemory<float>>(await File.ReadAllTextAsync(cacheFile.FullName).ConfigureAwait(false)),
                         };
 
                         chunkIndex++;
@@ -96,9 +109,9 @@ namespace ChatCompletionWithRAG
                         yield return new()
                         {
                             FullName = file.FullName,
-                            CacheFile = cacheFile.FullName,
                             ChunkIndex = chunkIndex,
-                            Vector = vector
+                            LastModifiedTimeUtc = file.LastWriteTimeUtc,
+                            TextEmbedding = vector,
                         };
 
                         chunkIndex++;
@@ -119,8 +132,13 @@ namespace ChatCompletionWithRAG
             }
             else
             {
-                var lines = TextChunker.SplitPlainTextLines(content, maxTokensPerLine: 10);
-                var paragraphs = TextChunker.SplitPlainTextParagraphs(lines, maxTokensPerParagraph: 25);
+                TokenCounter tokenCounter = new(c => tokenizer.CountTokens(c));
+                var lines = file.EndsWith(".md", StringComparison.OrdinalIgnoreCase)
+                    ? TextChunker.SplitMarkDownLines(content, maxTokensPerLine: 15, tokenCounter: tokenCounter)
+                    : TextChunker.SplitPlainTextLines(content, maxTokensPerLine: 15, tokenCounter: tokenCounter);
+                var paragraphs = file.EndsWith(".md", StringComparison.OrdinalIgnoreCase)
+                    ? TextChunker.SplitMarkdownParagraphs(lines, maxTokensPerParagraph: 40, tokenCounter: tokenCounter)
+                    : TextChunker.SplitPlainTextParagraphs(lines, maxTokensPerParagraph: 40, tokenCounter: tokenCounter);
 
                 // Azure OpenAI currently supports input arrays up to 16 for text-embedding-ada-002 (Version 2).
                 // Both require the max input token limit per API request to remain under 8191 for this model.
@@ -167,5 +185,26 @@ namespace ChatCompletionWithRAG
                 semaphore.Release();
             }
         }
+
+        public sealed class StatefulTokenCounter
+        {
+            private readonly Dictionary<string, int> _callStats = [];
+            private readonly Tokenizer _tokenizer = TiktokenTokenizer.CreateForModel("gpt-4");
+
+            public int Count(string input)
+            {
+                this.CallCount++;
+                this._callStats[input] = this._callStats.TryGetValue(input, out int value) ? value + 1 : 1;
+                return this._tokenizer.CountTokens(input);
+            }
+
+            public int CallCount { get; private set; } = 0;
+        }
+
+        private static TokenCounter StatelessTokenCounter => (string input) =>
+        {
+            var tokenizer = TiktokenTokenizer.CreateForModel("gpt-4");
+            return tokenizer.CountTokens(input);
+        };
     }
 }
