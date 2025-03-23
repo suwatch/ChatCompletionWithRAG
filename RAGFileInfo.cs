@@ -67,7 +67,8 @@ namespace ChatCompletionWithRAG
                         continue;
                     }
 
-                    throw new NotSupportedException("Need to delete old item");
+                    Console.WriteLine($"[WARNING] Mismatch LastWriteTimeUtc in VectorStore {file.FullName}");
+                    continue;
                 }
 
                 var fileDirectory = Directory.CreateDirectory(Path.Combine(cacheDirectory.FullName, $"{fileNameHash:x8}"));

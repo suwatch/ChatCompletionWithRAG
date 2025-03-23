@@ -5,12 +5,12 @@ namespace ChatCompletionWithRAG
 {
     public sealed class HttpLoggingHandler : DelegatingHandler
     {
-        private readonly bool _verbose;
+        private readonly TraceLevel _traceLevel;
 
-        public HttpLoggingHandler(HttpMessageHandler innerHandler = null, bool verbose = true)
+        public HttpLoggingHandler(HttpMessageHandler innerHandler = null, TraceLevel traceLevel = TraceLevel.Off)
             : base(innerHandler ?? new HttpClientHandler())
         {
-            _verbose = verbose;
+            _traceLevel = traceLevel;
         }
 
 #if NET6_0_OR_GREATER
@@ -22,36 +22,48 @@ namespace ChatCompletionWithRAG
 
         private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken, bool async)
         {
+            if (_traceLevel == TraceLevel.Off)
+            {
+#if NET
+                return async ? (await base.SendAsync(request, cancellationToken).ConfigureAwait(false)) : base.Send(request, cancellationToken);
+#else
+                return await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+#endif
+            }
+
             WriteLine("---------- Request -----------------------");
             WriteLine($"{request.Method} {request.RequestUri.PathAndQuery} HTTP/{request.Version}");
-            Write("Host: ");
-            WriteLine(request.RequestUri.Host);
-            foreach (var header in request.Headers)
+            if (_traceLevel == TraceLevel.Verbose)
             {
-                Write($"{header.Key}: ");
-                if (new[] { "Authorization", "api-key" }.Any(k => string.Equals(k, header.Key)))
+                Write("Host: ");
+                WriteLine(request.RequestUri.Host);
+                foreach (var header in request.Headers)
                 {
-                    WriteLine(header.Value.First().Substring(0, 20) + "...");
+                    Write($"{header.Key}: ");
+                    if (new[] { "Authorization", "api-key" }.Any(k => string.Equals(k, header.Key)))
+                    {
+                        WriteLine(header.Value.First().Substring(0, 20) + "...");
+                    }
+                    else
+                    {
+                        WriteLine(string.Join("; ", header.Value));
+                    }
                 }
-                else
+                if (request.Content is not null)
                 {
-                    WriteLine(string.Join("; ", header.Value));
+                    foreach (var header in request.Content.Headers)
+                    {
+                        WriteLine($"{header.Key}: {string.Join("; ", header.Value)}");
+                    }
                 }
-            }
-            if (request.Content is not null)
-            {
-                foreach (var header in request.Content.Headers)
-                {
-                    WriteLine($"{header.Key}: {string.Join("; ", header.Value)}");
-                }
-            }
 
-            WriteLine();
-
-            if (_verbose && request.Content is not null)
-            {
-                request.Content = await DumpContent(request.Content, cancellationToken, async).ConfigureAwait(false);
                 WriteLine();
+
+                if (_traceLevel == TraceLevel.Verbose && request.Content is not null)
+                {
+                    request.Content = await DumpContent(request.Content, cancellationToken, async).ConfigureAwait(false);
+                    WriteLine();
+                }
             }
 
             var watch = new Stopwatch();
@@ -63,27 +75,30 @@ namespace ChatCompletionWithRAG
 #endif
             watch.Stop();
 
-            WriteLine($"HTTP/{response.Version} {(int)response.StatusCode} {response.StatusCode}");
+            if (_traceLevel == TraceLevel.Verbose)
+            {
+                WriteLine($"HTTP/{response.Version} {(int)response.StatusCode} {response.StatusCode}");
 
-            foreach (var header in response.Headers)
-            {
-                Write($"{header.Key}: ");
-                WriteLine(string.Join("; ", header.Value));
-            }
-            if (response.Content is not null)
-            {
-                foreach (var header in response.Content.Headers)
+                foreach (var header in response.Headers)
                 {
                     Write($"{header.Key}: ");
                     WriteLine(string.Join("; ", header.Value));
                 }
-            }
-            WriteLine();
-
-            if (_verbose && response.Content is not null)
-            {
-                response.Content = await DumpContent(response.Content, cancellationToken, async).ConfigureAwait(false);
+                if (response.Content is not null)
+                {
+                    foreach (var header in response.Content.Headers)
+                    {
+                        Write($"{header.Key}: ");
+                        WriteLine(string.Join("; ", header.Value));
+                    }
+                }
                 WriteLine();
+
+                if (_traceLevel == TraceLevel.Verbose && response.Content is not null)
+                {
+                    response.Content = await DumpContent(response.Content, cancellationToken, async).ConfigureAwait(false);
+                    WriteLine();
+                }
             }
 
             WriteLine($"---------- Done ({(int)response.StatusCode} {response.StatusCode}, {watch.ElapsedMilliseconds} ms, request: {request.Content?.Headers.ContentLength} bytes) ------------");

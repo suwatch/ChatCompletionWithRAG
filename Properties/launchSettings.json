@@ -1,8 +1,7 @@
 {
   "profiles": {
     "ChatCompletionWithRAG": {
-      "commandName": "Project",
-      "commandLineArgs": "Learn security C:\\wagit\\AAPT\\Antares\\Docs\\TeamDocs\\GeneralTeamDocs\\Security *.md\r\n"
+      "commandName": "Project"
     }
   }
 }

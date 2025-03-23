@@ -35,7 +35,7 @@ namespace ChatCompletionWithRAG
 
             var mostRelevance = relevancies.OrderByDescending(r => r.Value).First();
 
-            Console.WriteLine($"[BestMatchedDoc] Hits: {mostRelevance.Value.hits} out of {2 * questionVectors.Count}, Relevance: {mostRelevance.Value.relevance:0.00}, file: {mostRelevance.Key}[chunk#{mostRelevance.Value.chunkIndex}]");
+            Program.WriteLine($"[BestMatchedDoc] Hits: {mostRelevance.Value.hits} out of {2 * questionVectors.Count}, Relevance: {mostRelevance.Value.relevance:0.00}, file: {mostRelevance.Key}[chunk#{mostRelevance.Value.chunkIndex}]");
 
             return JsonSerializer.Serialize(new { AssistantMessage = File.ReadAllText(mostRelevance.Key), Reference = mostRelevance.Key });
         }

@@ -32,7 +32,8 @@ namespace ChatCompletionWithRAG
         public static readonly string AzureAIDeploymentName = EnsureEnvironmentVariable("AZUREAI_DEPLOYMENTNAME");
         // set AZUREAI_TEXTEMBEDDING_DEPLOYMENTNAME=your-azure-ai-textembedding-deployment-name
         public static readonly string AzureAITextEmbeddingDeploymentName = EnsureEnvironmentVariable("AZUREAI_TEXTEMBEDDING_DEPLOYMENTNAME");
-        public static readonly TraceLevel HttpLoggingTraceLevel = int.TryParse(Environment.GetEnvironmentVariable("AZUREAI_HTTPLOGGING_TRACELEVEL"), out var value) ? (TraceLevel)value : TraceLevel.Off;
+        public static readonly TraceLevel HttpLoggingTraceLevel = Enum.TryParse<TraceLevel>(Environment.GetEnvironmentVariable("AZUREAI_HTTPLOGGING_TRACELEVEL"), out var value) ? value : TraceLevel.Off;
+        public static readonly TraceLevel DebugTraceLevel = Enum.TryParse<TraceLevel>(Environment.GetEnvironmentVariable("AZUREAI_TRACELEVEL"), out var value) ? value : TraceLevel.Off;
         public static readonly string RAGCacheDirectory = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AZUREAI_CACHE_DIRECTORY"))
             ? Environment.GetEnvironmentVariable("AZUREAI_CACHE_DIRECTORY") : Path.Combine(Environment.ExpandEnvironmentVariables(@"%USERPROFILE%\ChatCompletionWithRAGCache"));
 
@@ -123,8 +124,7 @@ namespace ChatCompletionWithRAG
             //await collection.CreateCollectionIfNotExistsAsync();
 
             var collection = kernel.GetRequiredService<IVectorStoreRecordCollection<string, RAGFileInfo>>();
-            if (!(await collection.CollectionExistsAsync()))
-                await collection.CreateCollectionIfNotExistsAsync();
+            await collection.CreateCollectionIfNotExistsAsync();
 
             // Create and upsert glossary entries into the collection.
             var textEmbeddingService = kernel.GetRequiredService<ITextEmbeddingGenerationService>();
@@ -273,13 +273,13 @@ namespace ChatCompletionWithRAG
                 var result = await kernel.InvokePromptAsync(
                     promptTemplate: alternativeQuestionsTemplate,
                     arguments: new(executionSettings) { { "originalQuestion", originalQuestion } })
-                    .WithProgress("QuestionTranslation").ConfigureAwait(false);
+                    .WithProgress().ConfigureAwait(false);
 
                 var questionsResult = JsonSerializer.Deserialize<QuestionsResult>(result.ToString());
-                for (int i = 0; i < questionsResult.AlternativeQuestions.Length; i++)
-                {
-                    Console.WriteLine($"Alternative Question[{i}]: {questionsResult.AlternativeQuestions[i]}");
-                }
+                //for (int i = 0; i < questionsResult.AlternativeQuestions.Length; i++)
+                //{
+                //    Console.WriteLine($"Alternative Question[{i}]: {questionsResult.AlternativeQuestions[i]}");
+                //}
 
                 var useLocalFile = false;
                 if (useLocalFile)
@@ -344,7 +344,7 @@ namespace ChatCompletionWithRAG
             var clientOptions = new AzureOpenAIClientOptions();
             if (HttpLoggingTraceLevel != TraceLevel.Off)
             {
-                clientOptions.Transport = new HttpClientPipelineTransport(new HttpClient(new HttpLoggingHandler(verbose: HttpLoggingTraceLevel == TraceLevel.Verbose)));
+                clientOptions.Transport = new HttpClientPipelineTransport(new HttpClient(new HttpLoggingHandler(traceLevel: HttpLoggingTraceLevel)));
             }
 
             var customClient = new AzureOpenAIClient(
@@ -375,7 +375,7 @@ namespace ChatCompletionWithRAG
                                 // When initializing CosmosClient manually, setting this property is required 
                                 // due to limitations in default serializer. 
                                 UseSystemTextJsonSerializerWithOptions = JsonSerializerOptions.Default,
-                                HttpClientFactory = () => new HttpClient(new HttpLoggingHandler(verbose: HttpLoggingTraceLevel == TraceLevel.Verbose)),
+                                HttpClientFactory = () => new HttpClient(new HttpLoggingHandler(traceLevel: HttpLoggingTraceLevel)),
                             }).GetDatabase(VectorDatabaseName));
                 // GetCollections not working - Only String and AzureCosmosDBNoSQLCompositeKey keys are supported
                 // builder.AddAzureCosmosDBNoSQLVectorStore();
@@ -402,7 +402,7 @@ namespace ChatCompletionWithRAG
 
         internal static async Task<T> WithProgress<T>(this Task<T> task, string info = "", int dotIntercalSecs = 1)
         {
-            Console.Write(info);
+            Program.Write(info);
             while (task != await Task.WhenAny(Task.Delay(dotIntercalSecs * 1_000), task).ConfigureAwait(false))
             {
                 Console.Write(".");
@@ -410,6 +410,27 @@ namespace ChatCompletionWithRAG
             Console.WriteLine();
 
             return await task.ConfigureAwait(false);
+        }
+
+        internal static void WriteLine(object msg)
+        {
+            WriteLine("{0}", msg);
+        }
+
+        internal static void WriteLine(string format, params object[] args)
+        {
+            if (DebugTraceLevel != TraceLevel.Off)
+            {
+                Console.WriteLine(format, args);
+            }
+        }
+
+        internal static void Write(string msg)
+        {
+            if (DebugTraceLevel != TraceLevel.Off)
+            {
+                Console.Write("{0}", msg);
+            }
         }
     }
 }
