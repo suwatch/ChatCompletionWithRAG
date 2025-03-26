@@ -1,7 +1,8 @@
 {
   "profiles": {
     "ChatCompletionWithRAG": {
-      "commandName": "Project"
+      "commandName": "Project",
+      "commandLineArgs": "learn enghub C:\\wagit\\AAPT\\Antares\\Docs\\TeamDocs\\UxTeamDocs\\OnCall *.md"
     }
   }
 }

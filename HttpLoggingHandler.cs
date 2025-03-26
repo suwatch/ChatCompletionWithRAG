@@ -31,10 +31,10 @@ namespace ChatCompletionWithRAG
 #endif
             }
 
-            WriteLine("---------- Request -----------------------");
-            WriteLine($"{request.Method} {request.RequestUri.PathAndQuery} HTTP/{request.Version}");
+            WriteLine($"---------- Request {request.Method} {request.RequestUri} -----------------------");
             if (_traceLevel == TraceLevel.Verbose)
             {
+                WriteLine($"{request.Method} {request.RequestUri.PathAndQuery} HTTP/{request.Version}");
                 Write("Host: ");
                 WriteLine(request.RequestUri.Host);
                 foreach (var header in request.Headers)
@@ -167,16 +167,7 @@ namespace ChatCompletionWithRAG
             return (clone, ms);
         }
 
-        private static void WriteLine(string message = null)
-        {
-            Console.WriteLine(message);
-            Debug.WriteLine(message);
-        }
-
-        private static void Write(string message = null)
-        {
-            Console.Write(message);
-            Debug.Write(message);
-        }
+        private static void WriteLine(string message = null) => Program.WriteLine(message);
+        private static void Write(string message = null) => Program.Write(message);
     }
 }

@@ -6,9 +6,11 @@ using System.Text.Json;
 using Azure.AI.OpenAI;
 using Azure.Core;
 using Azure.Identity;
+using Azure.Storage.Blobs;
 using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.VectorData;
+using Microsoft.IdentityModel.Abstractions;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.InMemory;
@@ -23,48 +25,35 @@ namespace ChatCompletionWithRAG
     internal static class Program
     {
         public const string DefaultFileExtensions = "*.txt,*.md";
-        public const string VectorDatabaseName = "antragdb";
 
         // set AZUREAI_NAME=your-azure-ai-name
         // make sure to Grant yourself "Cognitive Services OpenAI Contributor" RBAC to the AzureAI resource
         public static readonly string AzureAIName = EnsureEnvironmentVariable("AZUREAI_NAME");
         // set AZUREAI_DEPLOYMENTNAME=your-azure-ai-deployment-name
         public static readonly string AzureAIDeploymentName = EnsureEnvironmentVariable("AZUREAI_DEPLOYMENTNAME");
+        public static readonly string AzureAICosmosDBName = EnsureEnvironmentVariable("AZUREAI_COSMOSDBNAME");
         // set AZUREAI_TEXTEMBEDDING_DEPLOYMENTNAME=your-azure-ai-textembedding-deployment-name
         public static readonly string AzureAITextEmbeddingDeploymentName = EnsureEnvironmentVariable("AZUREAI_TEXTEMBEDDING_DEPLOYMENTNAME");
         public static readonly TraceLevel HttpLoggingTraceLevel = Enum.TryParse<TraceLevel>(Environment.GetEnvironmentVariable("AZUREAI_HTTPLOGGING_TRACELEVEL"), out var value) ? value : TraceLevel.Off;
         public static readonly TraceLevel DebugTraceLevel = Enum.TryParse<TraceLevel>(Environment.GetEnvironmentVariable("AZUREAI_TRACELEVEL"), out var value) ? value : TraceLevel.Off;
         public static readonly string RAGCacheDirectory = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AZUREAI_CACHE_DIRECTORY"))
             ? Environment.GetEnvironmentVariable("AZUREAI_CACHE_DIRECTORY") : Path.Combine(Environment.ExpandEnvironmentVariables(@"%USERPROFILE%\ChatCompletionWithRAGCache"));
+        public static readonly string AzureAIStorageName = EnsureEnvironmentVariable("AZUREAI_STORAGENAME");
+        public static string VectorDBName = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AZUREAI_VECTORDBNAME"))
+            ? Environment.GetEnvironmentVariable("AZUREAI_VECTORDBNAME") : "antragdb";
 
         static Dictionary<string, Func<string[], Task>> _methods = new(StringComparer.OrdinalIgnoreCase)
         {
             { nameof(Usage), Usage },
             { nameof(Learn), Learn },
             { nameof(Assist), Assist },
-            { nameof(CleanCache), CleanCache },
+            { nameof(CleanUp), CleanUp },
         };
 
         static async Task Main(string[] args)
         {
             try
             {
-                //var cosmosClient = new CosmosClient(
-                //    accountEndpoint: "https://kuduaicosmosdbnosql.documents.azure.com:443/",
-                //    tokenCredential: DefaultAzureCredentialHelper.GetDefaultAzureCredential(AzureAuthorityHosts.AzurePublicCloud.AbsoluteUri),
-                //    new CosmosClientOptions()
-                //    {
-                //        // When initializing CosmosClient manually, setting this property is required 
-                //        // due to limitations in default serializer. 
-                //        UseSystemTextJsonSerializerWithOptions = JsonSerializerOptions.Default,
-                //    });
-                //await cosmosClient.CreateDatabaseAsync("antragdb");
-                //var database = cosmosClient.GetDatabase("kuduaidb");
-                //var container = database.GetContainer("pdfcontent");
-                //await container.DeleteContainerAsync();
-                //var collection = await database.CreateContainerIfNotExistsAsync("pdfcontent", "/Key");
-                //return cosmosClient.GetDatabase(appConfig.AzureCosmosDBNoSQLConfig.DatabaseName);
-
                 var action = args.Length == 0 ? "Usage" : args[0];
                 if (!_methods.TryGetValue(action, out var func))
                 {
@@ -93,15 +82,15 @@ namespace ChatCompletionWithRAG
             var category = args[1];
             var kernel = CreateKernelWithPlugins(category);
             //var vectorStore = kernel.GetRequiredService<IVectorStore>();
-            var collection = kernel.GetRequiredService<IVectorStoreRecordCollection<string, RAGFileInfo>>();
-            if (collection is InMemoryVectorStoreRecordCollection<string, RAGFileInfo>)
-            {
-                throw new NotSupportedException("Assist is not supported for InMemoryVectorStore");
-            }
+            //var collection = kernel.GetRequiredService<IVectorStoreRecordCollection<string, RAGFileInfo>>();
+            //if (collection is InMemoryVectorStoreRecordCollection<string, RAGFileInfo>)
+            //{
+            //    throw new NotSupportedException("Assist is not supported for InMemoryVectorStore");
+            //}
 
-            var textEmbeddingService = kernel.GetRequiredService<ITextEmbeddingGenerationService>();
-            kernel.Plugins.AddFromObject(new TextSearchProvider(collection, kernel, textEmbeddingService), pluginName: "TextSearchProvider");
-
+            //var textEmbeddingService = kernel.GetRequiredService<ITextEmbeddingGenerationService>();
+            //kernel.Plugins.AddFromObject(new TextSearchProvider(collection, textEmbeddingService), pluginName: "TextSearchProvider");
+            
             //await RunChatLoop(kernel);
             await RunChatLoopWithTemplate(kernel);
         }
@@ -119,9 +108,6 @@ namespace ChatCompletionWithRAG
             var patterns = args.Length > 3 ? args[3] : DefaultFileExtensions;
 
             var kernel = CreateKernelWithPlugins(category);
-            //var vectorStore = kernel.GetRequiredService<IVectorStore>();
-            //var collection = vectorStore.GetCollection<string, RAGFileInfo>(category);
-            //await collection.CreateCollectionIfNotExistsAsync();
 
             var collection = kernel.GetRequiredService<IVectorStoreRecordCollection<string, RAGFileInfo>>();
             await collection.CreateCollectionIfNotExistsAsync();
@@ -129,13 +115,11 @@ namespace ChatCompletionWithRAG
             // Create and upsert glossary entries into the collection.
             var textEmbeddingService = kernel.GetRequiredService<ITextEmbeddingGenerationService>();
             var ragFiles = await LearnAndUpsertAsync(collection, directory, patterns, kernel, textEmbeddingService).ConfigureAwait(false);
-            // Testing Cache
-            // await LearnAndUpsertAsync(collection, directory, patterns, kernel, textEmbeddingService).ConfigureAwait(false);
 
             if (collection is InMemoryVectorStoreRecordCollection<string, RAGFileInfo>)
             {
-                kernel.Plugins.AddFromObject(new LocalFileSearchProvider(ragFiles, kernel, textEmbeddingService), pluginName: nameof(LocalFileSearchProvider));
-                kernel.Plugins.AddFromObject(new TextSearchProvider(collection, kernel, textEmbeddingService), pluginName: nameof(TextSearchProvider));
+                kernel.Plugins.AddFromObject(new LocalFileSearchProvider(ragFiles, textEmbeddingService), pluginName: nameof(LocalFileSearchProvider));
+                //kernel.Plugins.AddFromObject(new TextSearchProvider(collection, textEmbeddingService), pluginName: nameof(TextSearchProvider));
 
                 //await RunChatLoop(kernel);
                 await RunChatLoopWithTemplate(kernel);
@@ -158,6 +142,10 @@ namespace ChatCompletionWithRAG
                     //    Console.WriteLine($"Upsert: {result}, File: {item.FullName}#{item.ChunkIndex:000}");
                     //}
                     await collection.UpsertBatchAsync(ragFiles.Skip(startIndex)).ToListAsync();
+                    foreach (var upsert in ragFiles.Skip(startIndex))
+                    {
+                        Program.WriteLine($"Upsert: {upsert.Key}, File: {upsert.FullName}#{upsert.ChunkIndex:0000}");
+                    }
                     startIndex = ragFiles.Count;
                 }
             }
@@ -169,6 +157,10 @@ namespace ChatCompletionWithRAG
                 //    //Console.WriteLine($"Upsert: {result}, File: {item.FullName}#{item.ChunkIndex:000}");
                 //}
                 await collection.UpsertBatchAsync(ragFiles.Skip(startIndex)).ToListAsync();
+                foreach (var upsert in ragFiles.Skip(startIndex))
+                {
+                    Program.WriteLine($"Upsert: {upsert.Key}, File: {upsert.FullName}#{upsert.ChunkIndex:0000}");
+                }
             }
 
             return ragFiles;
@@ -177,11 +169,55 @@ namespace ChatCompletionWithRAG
             //await collection.UpsertBatchAsync(ragFiles).ToListAsync();
         }
 
-        static Task CleanCache(string[] args)
+        static async Task CleanUp(string[] args)
         {
-            Directory.Delete(Program.RAGCacheDirectory, recursive: true);
-            Console.WriteLine($"{Program.RAGCacheDirectory} deleted");
-            return Task.CompletedTask;
+            if (args.Length < 2)
+            {
+                Console.WriteLine("ChatCompletionWithRAG.exe cleanup category");
+                return;
+            }
+
+            var category = args[1];
+            var cacheDirectory = Path.Combine(Program.RAGCacheDirectory, category);
+            try
+            {
+                if (Directory.Exists(cacheDirectory))
+                {
+                    Directory.Delete(cacheDirectory, recursive: true);
+                }
+                Console.WriteLine($"Successfully delete '{cacheDirectory}' directory");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Fail to delete '{cacheDirectory}' directory due to {ex.Message}");
+            }
+
+            try
+            {
+                var kernel = CreateKernelWithPlugins(category);
+                var collection = kernel.GetRequiredService<IVectorStoreRecordCollection<string, RAGFileInfo>>();
+                if (await collection.CollectionExistsAsync())
+                {
+                    await collection.DeleteCollectionAsync();
+                }
+                Console.WriteLine($"Successfully delete '{category}' collection");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Fail to delete '{category}' collection due to {ex.Message}");
+            }
+
+            try
+            {
+                var blobServiceClient = new BlobServiceClient(new Uri($"https://{Program.AzureAIStorageName}.blob.core.windows.net/"), DefaultAzureCredentialHelper.GetDefaultAzureCredential(AzureAuthorityHosts.AzurePublicCloud.AbsoluteUri));
+                var containerClient = blobServiceClient.GetBlobContainerClient(category);
+                await containerClient.DeleteIfExistsAsync();
+                Console.WriteLine($"Successfully delete '{category}' storage container");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Fail to delete '{category}' storage container due to {ex.Message}");
+            }
         }
 
         static Task Usage(string[] args)
@@ -263,12 +299,13 @@ namespace ChatCompletionWithRAG
             while (true)
             {
                 Console.Write("Question: ");
-                var originalQuestion = "How long is MSI token cached?"; // Console.ReadLine();
+                var originalQuestion = Console.ReadLine();
+                //var originalQuestion = "How long is MSI token cached?";
+                // Console.WriteLine(originalQuestion);
                 if (string.IsNullOrWhiteSpace(originalQuestion))
                 {
                     break;
                 }
-                Console.WriteLine(originalQuestion);
 
                 var result = await kernel.InvokePromptAsync(
                     promptTemplate: alternativeQuestionsTemplate,
@@ -305,29 +342,13 @@ namespace ChatCompletionWithRAG
                 }
 
                 Console.WriteLine();
-                break;
             }
         }
 
-//        static async IAsyncEnumerable<RAGFileInfo> LearnFromDirectoryExAsync(string directory, string patterns, Kernel kernel, ITextEmbeddingGenerationService textEmbeddingService)
-//        {
-//            Console.WriteLine($"Learning from {directory} with patterns {patterns}");
-//            Console.WriteLine($"Caching at {Program.RAGCacheDirectory}");
-//            var results = new List<RAGFileInfo>();
-//            foreach (var pattern in patterns.Split([',', ';']))
-//            {
-//                await foreach (var ragFile in RAGFileInfo.EnumerateDirectory(directory, pattern, kernel, textEmbeddingService))
-//                {
-//                    yield return ragFile;
-//                }
-//            }
-////            return results;
-//        }
-
         static async IAsyncEnumerable<RAGFileInfo> LearnFromDirectoryAsync(IVectorStoreRecordCollection<string, RAGFileInfo> collection, string directory, string patterns, Kernel kernel, ITextEmbeddingGenerationService textEmbeddingService)
         {
-            Console.WriteLine($"Learning from {directory} with patterns {patterns}");
-            Console.WriteLine($"Caching at {Program.RAGCacheDirectory}");
+            Program.WriteLine($"Learning from {directory} with patterns {patterns}");
+            Program.WriteLine($"Caching at {Program.RAGCacheDirectory}");
             var results = new List<RAGFileInfo>();
             foreach (var pattern in patterns.Split([',', ';']))
             {
@@ -366,25 +387,36 @@ namespace ChatCompletionWithRAG
             }
             else
             {
-                builder.Services.AddSingleton<Database>(
-                    sp => new CosmosClient(
-                            accountEndpoint: "https://kuduaicosmosdbnosql.documents.azure.com:443/",
+                builder.Services.AddSingleton<Database>(sp =>
+                {
+                    var cosmosCLientOptions = new CosmosClientOptions()
+                    {
+                        // When initializing CosmosClient manually, setting this property is required 
+                        // due to limitations in default serializer. 
+                        UseSystemTextJsonSerializerWithOptions = JsonSerializerOptions.Default,
+                    };
+                    if (HttpLoggingTraceLevel != TraceLevel.Off)
+                    {
+                        cosmosCLientOptions.HttpClientFactory = () => new HttpClient(new HttpLoggingHandler(traceLevel: HttpLoggingTraceLevel));
+                    }
+                    var client = new CosmosClient(
+                            accountEndpoint: $"https://{AzureAICosmosDBName}.documents.azure.com:443/",
                             tokenCredential: DefaultAzureCredentialHelper.GetDefaultAzureCredential(AzureAuthorityHosts.AzurePublicCloud.AbsoluteUri), // new AzureCliCredential(),
-                            new CosmosClientOptions()
-                            {
-                                // When initializing CosmosClient manually, setting this property is required 
-                                // due to limitations in default serializer. 
-                                UseSystemTextJsonSerializerWithOptions = JsonSerializerOptions.Default,
-                                HttpClientFactory = () => new HttpClient(new HttpLoggingHandler(traceLevel: HttpLoggingTraceLevel)),
-                            }).GetDatabase(VectorDatabaseName));
+                            cosmosCLientOptions);
+                    var database = client.GetDatabase(VectorDBName);
+                    return database;
+                });
                 // GetCollections not working - Only String and AzureCosmosDBNoSQLCompositeKey keys are supported
                 // builder.AddAzureCosmosDBNoSQLVectorStore();
                 builder.AddAzureCosmosDBNoSQLVectorStoreRecordCollection<RAGFileInfo>(category);
             }
 
+            builder.Services.AddSingleton<TextSearchProvider>();
+            builder.Plugins.AddFromType<TextSearchProvider>(pluginName: "TextSearchProvider");
+
             foreach (var pluginType in pluginTypes)
             {
-                builder.Plugins.Add(KernelPluginFactory.CreateFromType(pluginType));
+                builder.Plugins.Add(KernelPluginFactory.CreateFromType(pluginType, pluginName: pluginType.Name));
             }
 
             return builder.Build();
@@ -400,19 +432,24 @@ namespace ChatCompletionWithRAG
             return value;
         }
 
-        internal static async Task<T> WithProgress<T>(this Task<T> task, string info = "", int dotIntercalSecs = 1)
+        internal static async Task<T> WithProgress<T>(this Task<T> task, string info = null, int dotIntercalSecs = 1)
         {
-            Program.Write(info);
-            while (task != await Task.WhenAny(Task.Delay(dotIntercalSecs * 1_000), task).ConfigureAwait(false))
+            if (Program.DebugTraceLevel == TraceLevel.Verbose)
             {
-                Console.Write(".");
+                var shouldWriteLine = info is not null;
+                if (info is not null) Program.Write(info);
+                while (task != await Task.WhenAny(Task.Delay(dotIntercalSecs * 1_000), task).ConfigureAwait(false))
+                {
+                    Program.Write(".");
+                    shouldWriteLine = true;
+                }
+                if (shouldWriteLine) Program.WriteLine();
             }
-            Console.WriteLine();
 
             return await task.ConfigureAwait(false);
         }
 
-        internal static void WriteLine(object msg)
+        internal static void WriteLine(object msg = null)
         {
             WriteLine("{0}", msg);
         }
@@ -421,7 +458,14 @@ namespace ChatCompletionWithRAG
         {
             if (DebugTraceLevel != TraceLevel.Off)
             {
-                Console.WriteLine(format, args);
+                lock (typeof(Console))
+                {
+                    Console.WriteLine(format, args);
+                }
+            }
+            else
+            {
+                Console.Write('.');
             }
         }
 
@@ -429,7 +473,14 @@ namespace ChatCompletionWithRAG
         {
             if (DebugTraceLevel != TraceLevel.Off)
             {
-                Console.Write("{0}", msg);
+                lock (typeof(Console))
+                {
+                    Console.Write("{0}", msg);
+                }
+            }
+            else
+            {
+                Console.Write('.');
             }
         }
     }

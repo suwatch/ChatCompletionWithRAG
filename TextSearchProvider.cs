@@ -6,14 +6,14 @@ using Microsoft.SemanticKernel.Embeddings;
 
 namespace ChatCompletionWithRAG
 {
-    public sealed class TextSearchProvider(IVectorStoreRecordCollection<string, RAGFileInfo> collection, Kernel kernel, ITextEmbeddingGenerationService textEmbeddingService)
+    public sealed class TextSearchProvider(IVectorStoreRecordCollection<string, RAGFileInfo> collection, ITextEmbeddingGenerationService textEmbeddingService)
     {
         [KernelFunction]
         [Description("Retrieve top search results to help answer any question.")]
         public async Task<IEnumerable<TextSearchResult>> GetTextSearchResults(
             [Description("The questions being asked")] QuestionsResult questionsResult)
         {
-            var relevancies = new Dictionary<string, (int hits, double relevance, int chunkIndex)>(StringComparer.OrdinalIgnoreCase);
+            var relevancies = new Dictionary<string, (int hits, double relevance, RAGFileInfo info)>(StringComparer.OrdinalIgnoreCase);
             if (collection is IVectorizableTextSearch<RAGFileInfo> search)
             {
                 for (int q = 0; q < questionsResult.AlternativeQuestions.Length; ++q)
@@ -24,18 +24,19 @@ namespace ChatCompletionWithRAG
                     await foreach (var vectorResult in vectorResults.Results)
                     {
                         var result = vectorResult.Record;
-                        relevancies[result.FullName] = relevancies.TryGetValue(result.FullName, out var value)
-                            ? (value.hits + 1, value.relevance + vectorResult.Score.Value, value.chunkIndex)
-                            : (1, vectorResult.Score.Value, result.ChunkIndex);
+                        relevancies[result.Key] = relevancies.TryGetValue(result.Key, out var value)
+                            ? (value.hits + 1, value.relevance + vectorResult.Score.Value, value.info)
+                            : (1, vectorResult.Score.Value, result);
 
-                        Console.WriteLine($"[HIT#q{q}a{a}] Relevance: {vectorResult.Score:0.00}, Total: {relevancies[result.FullName].relevance:0.00}, file: {result.FullName}[chunk#{result.ChunkIndex}]");
+                        Program.WriteLine($"[HIT#q{q}a{a}] Relevance: {vectorResult.Score:0.00}, Total: {relevancies[result.Key].relevance:0.00}, file: {result.FullName}#{result.ChunkIndex:0000}");
                         ++a;
                     }
                 }
             }
             else
             {
-                var questionVectors = await textEmbeddingService.GenerateEmbeddingsAsync(questionsResult.AlternativeQuestions, kernel: kernel).ConfigureAwait(false);
+                var questionVectors = await textEmbeddingService.GenerateEmbeddingsAsync(questionsResult.AlternativeQuestions).ConfigureAwait(false);
+                //var questionVectors = await textEmbeddingService.GenerateEmbeddingsAsync(questionsResult.AlternativeQuestions, kernel: kernel).ConfigureAwait(false);
                 var tasks = new List<Task<(string question, List<VectorSearchResult<RAGFileInfo>> results)>>();
                 for (int q = 0; q < questionVectors.Count; ++q)
                 {
@@ -48,47 +49,21 @@ namespace ChatCompletionWithRAG
                     var question = taskResult.question;
                     foreach (var vectorResult in taskResult.results)
                     {
-                        relevancies[vectorResult.Record.FullName] = relevancies.TryGetValue(vectorResult.Record.FullName, out var value)
-                            ? (value.hits + 1, value.relevance + vectorResult.Score.Value, value.chunkIndex)
-                            : (1, vectorResult.Score.Value, vectorResult.Record.ChunkIndex);
+                        relevancies[vectorResult.Record.Key] = relevancies.TryGetValue(vectorResult.Record.Key, out var value)
+                            ? (value.hits + 1, value.relevance + vectorResult.Score.Value, value.info)
+                            : (1, vectorResult.Score.Value, vectorResult.Record);
 
-                       // Console.WriteLine($"[HIT {question}] Relevance: {vectorResult.Score:0.00}, Total: {relevancies[vectorResult.Record.FullName].relevance:0.00}, file: {vectorResult.Record.FullName}[chunk#{vectorResult.Record.ChunkIndex}]");
+                        Program.WriteLine($"[HIT {question}] Relevance: {vectorResult.Score:0.00}, Total: {relevancies[vectorResult.Record.Key].relevance:0.00}, file: {vectorResult.Record.FullName}#{vectorResult.Record.ChunkIndex:0000}");
                     }
                 }
-
-                //var vectorSearchResults = questionVectors.Select(q => VectorizedSearchAsync(q, options: options));
-                //await Task.WhenAll(vectorSearchResults);
-
-                //var tasks = vectorSearchResults.Select(t => t.Result.Results.ToListAsync());
-                //await Task.WhenAll(tasks);
-
-                //    for (int q = 0; q < questionVectors.Count; ++q)
-                //    {
-                //        var questionVector = questionVectors[q];
-                //        var question = questionsResult.AlternativeQuestions[q];
-
-                //        var vectorResults = await collection.VectorizedSearchAsync(questionVector, new() { Top = 2 });
-                //        int a = 0;
-                //        await foreach (var vectorResult in vectorResults.Results)
-                //        {
-                //            var result = vectorResult.Record;
-                //            relevancies[result.FullName] = relevancies.TryGetValue(result.FullName, out var value)
-                //                ? (value.hits + 1, value.relevance + vectorResult.Score.Value, value.chunkIndex)
-                //                : (1, vectorResult.Score.Value, result.ChunkIndex);
-
-                //            Console.WriteLine($"[HIT#q{q}a{a}] Relevance: {vectorResult.Score:0.00}, Total: {relevancies[result.FullName].relevance:0.00}, file: {result.FullName}[chunk#{result.ChunkIndex}]");
-                //            ++a;
-                //        }
-                //    }
-                //}
             }
 
             var searchResults = new List<TextSearchResult>();
-            foreach (var relevance in relevancies.OrderByDescending(r => r.Value).Take(1))
+            foreach (var relevance in relevancies.OrderByDescending(r => r.Value.relevance).Take(1))
             {
-                Program.WriteLine($"[BestMatchedDoc] Hits: {relevance.Value.hits} out of {2 * questionsResult.AlternativeQuestions.Length}, Relevance: {relevance.Value.relevance:0.00}, file: {relevance.Key}[chunk#{relevance.Value.chunkIndex}]");
-                var content = await File.ReadAllTextAsync(relevance.Key).ConfigureAwait(false);
-                searchResults.Add(new TextSearchResult(content) { Link = relevance.Key, Name = relevance.Key });
+                Program.WriteLine($"[BestMatchedDoc] Hits: {relevance.Value.hits} out of {2 * questionsResult.AlternativeQuestions.Length}, Relevance: {relevance.Value.relevance:0.00}, file: {relevance.Value.info.FullName}#{relevance.Value.info.ChunkIndex:0000}");
+                var content = await relevance.Value.info.DownloadBlobAsync(containerName: collection.CollectionName);
+                searchResults.Add(new TextSearchResult(content) { Link = relevance.Value.info.FullName, Name = relevance.Value.info.FullName });
             }
 
             return searchResults;
